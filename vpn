@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+die() { exit "$1"; }
+trap 'die $?' EXIT
+
+type -P http jq >/dev/null 2>&1
+
+API=${API:-https://192.168.8.1}
+
+export HTTPIE_CONFIG_DIR=${HTTPIE_CONFIG_DIR:-${HOME}/.gl-inet}
+cd "${HTTPIE_CONFIG_DIR}"
+
+[[ -o xtrace ]] && TRACE=1 || TRACE=0
+set +x
+[[ -s .env ]] && source .env
+[[ ${TRACE} -eq 1 ]] && set -x
+
+umask 027
+
+login() {
+  [[ -o xtrace ]] && TRACE=1 || TRACE=0
+  set +x
+  local login
+  login=$(http --session=./template.json ${API}/api/router/login pwd=="${PASSWORD}")
+  jq '$session[] + {headers:{Authorization:.token}}' --slurpfile session template.json <<< "${login}" > session.json
+  #jq '.headers={Authorization:$login[].token}' --slurpfile login login.json session.json
+  [[ ${TRACE} -eq 1 ]] && set -x
+  return 0
+}
+
+action() {
+  local action=${1}; shift
+  [[ ${action}    == start ]] && safe_mode=true policy=true || safe_mode=false policy=false
+  [[ ${safe_mode} == false ]] && safe_mode_delay=10 || safe_mode_delay=0
+  [[ ${safe_mode} == true  ]] && vpn_start_delay=10 || vpn_start_delay=0
+  vpn_stop_delay=0
+  vpn_delay=vpn_${action}_delay
+  restart=${restart:-0}
+  ( sleep ${safe_mode_delay} && \
+    http --quiet --ignore-stdin ${API}/cgi-bin/api/safe_mode/set enable=${safe_mode} --form && \
+    http --quiet --ignore-stdin ${API}/cgi-bin/api/policy/enable enable=${policy} --form && \
+    http --quiet --ignore-stdin ${API}/cgi-bin/api/policy/local policy=forward --form &
+  )
+  ( sleep ${vpn_start_delay} && \
+    http --quiet --ignore-stdin ${API}/cgi-bin/api/wireguard/client/${action} name=${SERVER} restart=${restart} --form &
+  )
+  return 0
+}
+
+status() {
+  ( http ${API}/cgi-bin/api/wireguard/client/status | jq '{main_server},{enable}' &&
+    http ${API}/cgi-bin/api/safe_mode/get | jq '{safe_mode:.enable}' &&
+    http ${API}/cgi-bin/api/policy/get | jq '{policy:.enable}' ;
+  ) | jq -sc 'add | [{server:.main_server},del(.main_server)] | add'
+  return 0
+}
+
+finish() { exit 0; }
+
+login
+STATUS=$(status); export STATUS
+
+ARGS=(${@:-status})
+CMD=${ARGS[0]}
+export SERVER=${ARGS[1]:-${SERVER:-$(jq -nr env.STATUS | jq -r .server)}}
+
+[[ ${CMD} == status  ]] && { jq -nr env.STATUS | jq -cr; finish; }
+[[ ${CMD} == restart ]] && { restart=1 action start; finish; }
+[[ ${CMD} == start   ]] && { action "${CMD}"; finish; }
+[[ ${CMD} == stop    ]] && { action "${CMD}"; finish; }
+[[ ${CMD} =~ .*      ]] && { jq -nr env.STATUS | jq -cr; finish; }
+
+exit 0
